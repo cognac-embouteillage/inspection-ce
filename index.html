@@ -567,6 +567,7 @@ const DB={
 };
 async function connectShared(){
   if(!(window.claude && typeof window.claude.use==='function')){
+    if(SB.url){ await sbConnect(); return; }
     if(!isMSHost()) return;
     try{ await msInit(); }catch(e){ msError="Le module de connexion Microsoft n'a pas pu se charger : vérifiez la connexion internet."; }
     if(!msAccount){ view={name:'login'}; return; }
@@ -1835,6 +1836,73 @@ async function buildPlanXlsx(ExcelJS, list){
   return wb.xlsx.writeBuffer();
 }
 
+/* ================= SUPABASE : partage des données hors claude.ai ================= */
+const SB={ url:'https://bxluecwyxesomavbwzen.supabase.co', key:'sb_publishable_BUTb8XOgQ5iaL4-O0jHZpA_9zrimkwW',
+  lib:'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js' };
+let sb=null, sbUser=null, sbError='';
+const sbListeners=new Map();
+async function sbConnect(){
+  try{ if(!(window.supabase&&window.supabase.createClient)) await loadScript(SB.lib);
+    sb=window.supabase.createClient(SB.url,SB.key,{auth:{persistSession:true,autoRefreshToken:true}}); }
+  catch(e){ sb=null; sbError="Le module de connexion n’a pas pu se charger : vérifiez la connexion internet, puis rechargez la page."; view={name:'login'}; return; }
+  try{ const {data}=await sb.auth.getSession(); sbUser=data&&data.session?data.session.user:null; }catch(e){ sbUser=null; }
+  if(!sbUser){ view={name:'login'}; return; }
+  rdb=SBDB; canWrite=true;
+}
+function sbErr(error,status){ const e=new Error((error&&error.message)||'supabase');
+  if(status===401||status===403||(error&&(error.code==='42501'||error.code==='PGRST301'))) e.code='not_granted'; return e; }
+async function sbSelect(c,f){ const out=[];
+  for(let from=0;;from+=1000){ let q=sb.from('documents').select('data').eq('collection',c); if(f) q=f(q);
+    const {data,error,status}=await q.order('id').range(from,from+999); if(error) throw sbErr(error,status);
+    out.push(...(data||[]).map(r=>r.data)); if(!data||data.length<1000) break; }
+  return out; }
+function sbPing(c){ const set=sbListeners.get(c); if(set) set.forEach(fn=>{ try{ fn(); }catch(e){} }); }
+const SBDB={ collection(c){ return {
+  doc(id){ return {
+    async set(o){ const {error,status}=await sb.from('documents').upsert({collection:c,id:String(id),data:o,insp_id:(o&&o.inspId!=null)?String(o.inspId):null});
+      if(error) throw sbErr(error,status); sbPing(c); },
+    async get(){ const {data,error,status}=await sb.from('documents').select('data').eq('collection',c).eq('id',String(id)).maybeSingle();
+      if(error) throw sbErr(error,status); return {exists:!!data,data:()=>data?clone(data.data):undefined}; },
+    async delete(){ const {error,status}=await sb.from('documents').delete().eq('collection',c).eq('id',String(id));
+      if(error) throw sbErr(error,status); sbPing(c); } }; },
+  async get(){ const l=await sbSelect(c); return {docs:l.map(o=>({data:()=>clone(o)}))}; },
+  where(f,op,v){ return { async get(){ const l=await sbSelect(c, q=> f==='inspId'? q.eq('insp_id',String(v)) : q.eq('data->>'+f,String(v)));
+    return {docs:l.map(o=>({data:()=>clone(o)}))}; } }; },
+  onSnapshot(fn,err){ let alive=true, busy=false, again=false, timer=null;
+    const load=async()=>{ if(!alive) return; if(busy){ again=true; return; } busy=true;
+      try{ const l=await sbSelect(c); if(alive) fn({docs:l.map(o=>({data:()=>clone(o)}))}); }
+      catch(e){ if(e&&e.code==='not_granted'&&err) err(e); }
+      busy=false; if(again){ again=false; load(); } };
+    const later=()=>{ clearTimeout(timer); timer=setTimeout(load,400); };
+    const set=sbListeners.get(c)||new Set(); sbListeners.set(c,set); set.add(later);
+    let ch=null; try{ ch=sb.channel('doc-'+c+'-'+Math.random().toString(36).slice(2,7))
+      .on('postgres_changes',{event:'*',schema:'public',table:'documents',filter:'collection=eq.'+c},later).subscribe(); }catch(e){}
+    const poll=setInterval(()=>{ if(!document.hidden) load(); },60000);
+    load();
+    return ()=>{ alive=false; set.delete(later); clearInterval(poll); clearTimeout(timer); try{ ch&&sb.removeChannel(ch); }catch(e){} }; } }; } };
+function renderSbLogin(app){
+  setBar('Connexion', false); setDock(null);
+  app.innerHTML=`<section class="hero"><div class="hero-top"><div><h2>Inspections</h2><p>Connectez-vous avec l’identifiant fourni par le service qualité pour accéder aux inspections partagées.</p></div>
+    <img class="hero-logo" src="${LOGO}" alt="Logo Cognac Embouteillage"></div></section>
+    <div class="warn" id="sb-err" style="margin:0 0 14px;${sbError?'':'display:none'}">${esc(sbError)}</div>
+    <section class="card">
+      <div class="field"><label for="sb-mail">Adresse e-mail</label><input class="input" type="email" id="sb-mail" autocomplete="username" inputmode="email"></div>
+      <div class="field"><label for="sb-pass">Mot de passe</label><input class="input" type="password" id="sb-pass" autocomplete="current-password"></div>
+      <button class="btn block" id="sb-login">Se connecter</button>
+      <p class="hint" style="margin:12px 0 0">Mot de passe oublié ? Contactez le service qualité.</p></section>`;
+  const showErr=t=>{ const er=$('#sb-err'); er.textContent=t; er.style.display=''; };
+  const doLogin=async()=>{ const m=$('#sb-mail').value.trim(), pw=$('#sb-pass').value, b=$('#sb-login');
+    if(!m||!pw){ showErr('Saisissez votre adresse e-mail et votre mot de passe.'); return; }
+    if(!sb){ location.reload(); return; }
+    b.disabled=true; b.textContent='Connexion…';
+    let error=null; try{ ({error}=await sb.auth.signInWithPassword({email:m,password:pw})); }catch(e){ error=e||{message:''}; }
+    if(error){ b.disabled=false; b.textContent='Se connecter';
+      showErr(/invalid/i.test(error.message||'')?'Adresse e-mail ou mot de passe incorrect.':'Connexion impossible : vérifiez la connexion internet.'); return; }
+    location.reload(); };
+  $('#sb-login').onclick=doLogin;
+  $('#sb-pass').onkeydown=e=>{ if(e.key==='Enter') doLogin(); };
+}
+
 /* ================= MICROSOFT 365 (SharePoint) : partage des données hors claude.ai ================= */
 const MS={ clientId:'fcf38545-ae70-4d62-8ac7-04e6e14436b3', tenant:'58e828ce-5a79-4a51-9fb5-d5f56908a72e',
   host:'prestationsdufief.sharepoint.com', sitePath:'/sites/QualitCognacEmbouteillage', root:'Application Inspections',
@@ -1926,6 +1994,7 @@ const SPDB={ collection(c){ return {
     tick(); return ()=>{ alive=false; set.delete(fn); }; } }; } };
 async function spFallback(c){ const store=Object.keys(COLL).find(k=>COLL[k]===c); if(!store) return []; return ((await LocalDB.all(store).catch(()=>[]))||[]).filter(x=>x._mirror).map(strip); }
 function renderLogin(app){
+  if(SB.url) return renderSbLogin(app);
   setBar('Connexion', false); setDock(null);
   app.innerHTML=`<section class="hero"><div class="hero-top"><div><h2>Inspections</h2><p>Connectez-vous avec votre compte Microsoft professionnel pour accéder aux inspections partagées sur le site SharePoint Qualité.</p></div>
     <img class="hero-logo" src="${LOGO}" alt="Logo Cognac Embouteillage"></div></section>
@@ -1955,10 +2024,12 @@ function renderHub(app){
   app.innerHTML=`<section class="hero"><div class="hero-top"><div><h2>Inspections</h2><p>Choisissez le type d'inspection à réaliser ou à consulter.</p></div>
     <img class="hero-logo" src="${LOGO}" alt="Logo Cognac Embouteillage"></div></section>
   ${msAccount&&rdb===SPDB?`<div class="ms-acc"><span>Connecté : <b>${esc(msAccount.name||msAccount.username)}</b> · données partagées sur SharePoint</span><button class="btn ghost sm" id="ms-out">Se déconnecter</button></div>`:''}
+  ${sbUser&&rdb===SBDB?`<div class="ms-acc"><span>Connecté : <b>${esc(sbUser.email||'')}</b> · données partagées</span><button class="btn ghost sm" id="sb-out">Se déconnecter</button></div>`:''}
   <div class="mods">${card(MODS.prop)}${card(MODS.log)}${card(MODS.bv)}</div>
   <h3 class="section-title">Planning des inspections</h3>
   <div class="card planning" id="planning"><div class="empty">Chargement du planning…</div></div>`;
   renderPlanning();
+  const so=$('#sb-out'); if(so) so.onclick=async()=>{ if(await askConfirm('Se déconnecter ?','Les modifications pas encore envoyées restent sur cet appareil et partiront à la prochaine connexion.','Se déconnecter',true)){ try{ await sb.auth.signOut(); }catch(e){} location.reload(); } };
   const mo=$('#ms-out'); if(mo) mo.onclick=async()=>{ if(await askConfirm('Se déconnecter ?','Les modifications pas encore envoyées restent sur cet appareil et partiront à la prochaine connexion.','Se déconnecter',true)) msLogout(); };
   Object.values(MODS).forEach(async m=>{ const st=await modStats(m); const el=$('#ms-'+m.id); if(!el||view.name!=='hub') return;
     const parts=[]; if(st.late) parts.push(`<b class="ms-late">${st.late} action${st.late>1?'s':''} en retard</b>`); if(st.inc) parts.push(`<b class="ms-late">${st.inc} incident${st.inc>1?'s':''} ouvert${st.inc>1?'s':''}</b>`);
